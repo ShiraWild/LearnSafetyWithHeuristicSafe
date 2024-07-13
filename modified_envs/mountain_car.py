@@ -1,6 +1,8 @@
 from gym.envs.classic_control import MountainCarEnv
 
 
+
+
 class MountainCarWithCost(MountainCarEnv):
     def __init__(self, max_safe_velocity):
         super().__init__()

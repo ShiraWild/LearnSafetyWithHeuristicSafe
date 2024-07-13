@@ -16,6 +16,7 @@ import time
 
 parser = argparse.ArgumentParser()
 
+# ppo arguments
 parser.add_argument("--lr_actor", type=float, default=0.0003,
                     help="learning rate for actor network")
 parser.add_argument("--lr_critic", type=float, default=0.001,
@@ -36,7 +37,8 @@ parser.add_argument("--update_freq", type=int, default=5,
                     help="update frequency for PPO, after x episodes")
 parser.add_argument("--update_stats_saving", type=int, default=2,
                     help="save stats after x episodes")
-
+parser.add_argument("--render", type=bool, default=False,
+                    help="sets environment rendering")
 
 
 # TODO - CRITIC params -  change default value here
@@ -47,7 +49,7 @@ parser.add_argument("--unsafe_tresh_for_masking", type=float, default=0.5,
 parser.add_argument("--mc_depth", type=int, default=3,
                     help="determined depth for monte carlo search.")
 parser.add_argument("--use_safe_heuristic", type=bool, default=True,
-                    help="true - use safe heuristic, false - dont use.")
+                    help="True - use safe heuristic, False - don't use.")
 
 
 
@@ -60,34 +62,38 @@ def register_env(env_id, entry_point):
         kwargs={'max_safe_velocity': args.max_safe_velocity}
     )
 
-def compute_ppo_rewards_and_terminal(env, ppo_selected_action):
-    # an aid function, helps to get the 'reward' to be saved in the PPO algorithm
-    copied_env = copy.deepcopy(env)
-    state, reward, done, info = copied_env.step(ppo_selected_action.item())
-    return reward, done
-
 def compute_heuristic_masking(monte_carlo_scores, unsafe_tresh):
     # aid function to compute the masking based on heuristic (MC) scores
     masking_list = [0 if monte_carlo_scores[key] >= unsafe_tresh else 1 for key in monte_carlo_scores]
     # 0 - not safe, 1 - safe
     return masking_list
 
-def monte_carlo_safety_estimate_per_action(env, state, action,  mc_depth):
+def compute_ppo_rewards_and_terminal(env, ppo_selected_action):
+    # an aid function, helps to get the 'reward' to be saved in the PPO algorithm
+    copied_env = copy.deepcopy(env)
+    state, reward, done, info = copied_env.step(ppo_selected_action.item())
+    return reward, done
+
+def monte_carlo_safety_estimate_per_action(env, state, action, mc_depth):
+    # another deep copy for each action
+    copied_env = copy.deepcopy(env)
     # an aid function, returns the safety score for a given state+action based on our heuristic
     total_cost = []
-    state, reward, done, info = env.step(action)
+    # utilize the given action
+    state, reward, done, info = copied_env.step(action)
+    # cost = 0 -> safe, cost = 1 -> not safe.
     cost = info['cost']
     total_cost.append(cost)
     # Perform actions in the copied environment up to the specified depth, from the given action
     for _ in range(mc_depth):
-        action = env.action_space.sample()
-        state, reward, done, info = env.step(action)
+        action = copied_env.action_space.sample()
+        state, reward, done, info = copied_env.step(action)
         cost = info['cost']
-        # 1 - action is safe. 0 - action is not safe
         total_cost.append(cost)
         if done:
             break
     # returns the average cost over all 'depths' per 1 action
+    # bigger cost -> less safe.
     return sum(total_cost)/len(total_cost)
 
 def monte_carlo_safety_estimate(env, state,  mc_depth):
@@ -98,7 +104,7 @@ def monte_carlo_safety_estimate(env, state,  mc_depth):
     for action in list(candidate_actions.keys()):
         candidate_actions[action] = monte_carlo_safety_estimate_per_action(copied_env, copied_state, action, mc_depth)
     # return an estimated score 'heuristic' for each score
-    # higher = not safe.
+    # higher -> less safe.
     return candidate_actions
 
 
@@ -146,35 +152,39 @@ possible_actions = [0,1,2]
 # algorithm
 state_dim = np.prod(env.observation_space.shape)
 action_dim = env.action_space.n
-RL_algorithm = PPO(state_dim, action_dim, lr_actor, lr_critic, gamma, K_epochs, eps_clip, has_continuous_action_space, action_std)
+ppo_algorithm = PPO(state_dim, action_dim, lr_actor, lr_critic, gamma, K_epochs, eps_clip, has_continuous_action_space, action_std)
 
 # counters or stats lists
-
-amount_of_episodes = 0
+i_episode = 0
 time_steps, rewards, costs, episode_lengths = [[] for _ in range(4)]
 time_step = 0
 
 
-
 while time_step <= max_time_steps:
     # start a new episode with a random action
-    random_action = random.choice(possible_actions)
     state, info = env.reset()
-
-    state, reward, done, info = env.step(random_action)
     current_ep_reward = 0
     current_ep_cost = 0
     current_ep_len = 0
-    amount_of_episodes += 1
+    i_episode += 1
+
     for t in range(1, max_ep_len + 1):
+
+        # select action with policy
+        if args.render:
+            env.render()
+
         time_step += 1
         # get policy probabilities
-        ppo_action_probs, ppo_action_log_prob, ppo_selected_action = RL_algorithm.select_action(state)
+
+        ppo_action_probs, ppo_selected_action_prob, ppo_selected_action = ppo_algorithm.select_action(state)
+        # create a state copy
+        prev_state = state
 
         # TODO - show Or and Noa - IDK!
         ppo_reward, ppo_terminal = compute_ppo_rewards_and_terminal(env=env, ppo_selected_action=ppo_selected_action)
-        RL_algorithm.buffer.rewards.append(torch.tensor(ppo_reward))
-        RL_algorithm.buffer.is_terminals.append(torch.tensor(ppo_terminal))
+        ppo_algorithm.buffer.rewards.append(torch.tensor(ppo_reward))
+        ppo_algorithm.buffer.is_terminals.append(torch.tensor(ppo_terminal))
 
 
         # use masking for the monte carlo scores. 0 - not safe, 1 - safe
@@ -201,7 +211,7 @@ while time_step <= max_time_steps:
     costs.append(current_ep_cost)
     episode_lengths.append(current_ep_len)
 
-    if amount_of_episodes % UPDATE_FREQ == 0:
-        RL_algorithm.update()
-    if amount_of_episodes % SAVE_STATS == 0:
+    if i_episode % UPDATE_FREQ == 0:
+        ppo_algorithm.update()
+    if i_episode % SAVE_STATS == 0:
         torch.save((time_steps, rewards, costs, episode_lengths), base_path + "stats.log")
